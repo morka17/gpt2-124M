@@ -2,6 +2,7 @@ import inspect
 import os
 import time
 from distutils import dist
+from hellaswag import get_most_likely_row, iterate_examples, render_example
 import tiktoken 
 from dataclasses import dataclass 
 import torch 
@@ -320,7 +321,7 @@ if master_process:
     print(f"effective batch size: {B * T * grad_accum_steps * ddp_world_size}")
 
     
-
+enc = tiktoken.get_encoding("gpt2")
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train" )
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val" )
 # train_loader = DataLoaderLite(B=4, T=32)
@@ -329,7 +330,10 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model.eval()
 model.to(device)
-mode = torch.compile(model)
+use_compile = False
+if use_compile: 
+    mode = torch.compile(model)
+
 if ddp: 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model 
@@ -337,7 +341,7 @@ if ddp:
 max_lr = 6e-4 
 min_lr = max_lr * 0.1 
 warmup_steps = 715 
-max_steps = 19073
+max_steps = 19073  * 4 
 def get_lr(it):
     # Linear warmup for warmup steps 
     if it < warmup_steps: 
@@ -354,11 +358,21 @@ def get_lr(it):
 # optimizer = model.configure_optimizers(weight_decay=0.2, learning_rate=6e-4, device=device)
 optimizer = raw_model.configure_optimizers(weight_decay=0.2, learning_rate=6e-4, device=device)
 
+# create the log directory we will write checkpoints and logs 
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "log.txt")
+with open(log_file, "w") as f: 
+    pass 
+
+
 for step in range(max_steps):
     t0 = time.time()
+    last_step = (step == max_steps - 1)
 
+    
     # once in a while, validate the model 
-    if step % 100 == 0: 
+    if step % 250 == 0 or last_step: 
         mode.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -374,10 +388,59 @@ for step in range(max_steps):
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process: 
-            print(f"step {step} | val loss: {val_loss_accum.item():.4f}")
+            print(f"validation loss: {val_loss_accum.item()}:.4f")
+            with open(log_file, "a") as f:
+                f.write(f"step {step} | val loss: {val_loss_accum.item():.4f}")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(), 
+                    'config': raw_model.config, 
+                    'step': step, 
+                    'val_loss': val_loss_accum.item(),
+                    'optimizer': optimizer.state_dict(),
+                }
+                # todo: add optimizer.state_dict() and 
+                # rng seeds 
+                torch.save(checkpoint, checkpoint_path)
+
+
+    # once a while evaluate hellaswag 
+    if (step % 250 ==0 or last_step) and (not use_compile): 
+        num_correct_norm = 0 
+        num_total = 0 
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank 
+            if i % ddp_world_size != ddp_rank: 
+                continue 
+            # forward the model 
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device) 
+            mask = mask.to(device)
+            # get the logits 
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1 
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.Reduceop.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"Hellaswag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f :
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+    
 
     # disable torch.compile, the code will work fine 
-    if step > 0 and step % 100 == 0: 
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile): 
         model.eval()
         num_return_sequences = 4 
         max_length = 32 
@@ -404,6 +467,7 @@ for step in range(max_steps):
             tokens = xgen[i, :max_length].tolist()
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
+    
     # train step 
     mode.train()
     loss_accum = 0.0 
@@ -433,7 +497,9 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt 
     if master_process:
-        print(f"step {step} |  loss: {loss_accum.item():.4f} | lr: {lr:.6e} | norm: {norm:.4f} | dt: {dt:.2f}ms  | tokens/sec: {tokens_per_sec:.2f}")         
+        print(f"step {step} |  loss: {loss_accum.item():.4f} | lr: {lr:.6e} | norm: {norm:.4f} | dt: {dt:.2f}ms  | tokens/sec: {tokens_per_sec:.2f}")   
+        with open(log_file) as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")      
 
 if ddp: 
     dist.destroy_process_group()
@@ -441,27 +507,6 @@ if ddp:
 # print(loss)
 import sys; sys.exit(0)
 
-
-
-
-
-
-
-
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length: 
-    # forward the odel to get the logits
-    with torch.no_grad():
-        logits = model(x)  # (B, T, vocab_size)
-        logits = logits[:, -1, :]  # (B, vocab_size)
-        # get the probabilities 
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, 1)  # (B, 1)
-        xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
-        # append to the sequence 
-        x = torch.cat([x , xcol], dim=1)
 
 
 
